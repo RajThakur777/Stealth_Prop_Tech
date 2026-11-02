@@ -155,3 +155,56 @@ You must understand every line you submit. We check this with your video and in 
 5. Paste the repository link and the video link in the application form.
 
 We will run `pnpm install && pnpm check && pnpm typecheck && pnpm test` on your repository.
+
+## Decisions
+
+### 1. Atomic Conditional Updates with Idempotency Key for Safe Concurrency
+
+In serverless environments like Cloudflare Workers, in-memory application mutexes do not protect against concurrent requests across worker isolates. We implemented atomic conditional execution directly in SQLite:
+```sql
+UPDATE shares
+SET paid_at = ?, idempotency_key = ?
+WHERE id = ? AND bill_id = ? AND paid_at IS NULL
+```
+
+- **Concurrency Protection:** If two requests race to pay the same share simultaneously, SQLite's atomic write serialization ensures that only one request receives `changes === 1`. The second request sees `changes === 0`, detects the share was already paid, and safely returns `409 Conflict`.
+- **Idempotency Replay:** If a request with the same `Idempotency-Key` is re-sent (e.g. on network timeout or retry), the API returns the original `200 OK` response with the identical `paidAt` timestamp without double-charging or mutating state.
+
+### 2. Monotonic Sequential Member Ordering & Clean Correlated Subqueries
+
+The specification requires remainder cents from uneven splits to be distributed to members in the exact order they joined, and balances must be listed in that same order.
+- **Why `rowid`:** Relying on ISO timestamps (`created_at`) risks collisions when members are added within the same millisecond during automated batch operations or tests. SQLite's 64-bit integer `rowid` (`ORDER BY m.rowid ASC`) is strictly monotonic and guaranteed to reflect true insertion order.
+- **Correlated Subquery for Balances:** For `GET /api/homes/:homeId/balances`, instead of a multi-table `LEFT JOIN` which requires grouping and can be vulnerable to join duplication, we use a clean correlated subquery:
+
+  ```sql
+  SELECT
+    m.id AS memberId,
+    m.name AS name,
+    COALESCE((
+      SELECT SUM(s.amount_cents)
+      FROM shares s
+      JOIN bills b ON s.bill_id = b.id
+      WHERE s.member_id = m.id
+        AND b.home_id = m.home_id
+        AND s.paid_at IS NULL
+    ), 0) AS outstandingCents
+  FROM members m
+  WHERE m.home_id = ?
+  ORDER BY m.rowid ASC
+  ```
+
+  This guarantees that members with no bills or fully paid bills reliably receive `outstandingCents: 0` without risking cartesian products.
+
+### 3. Named Schema Constraints for Defense-in-Depth
+
+In `api/migrations/0001_init.sql`, we defined explicit named constraints to guarantee database integrity even in the event of unexpected application-level edge cases:
+- `CONSTRAINT fk_members_home FOREIGN KEY (home_id) REFERENCES homes(id) ON DELETE CASCADE`: Stops orphaned member records when homes are deleted or invalid.
+- `CONSTRAINT fk_bills_home FOREIGN KEY (home_id) REFERENCES homes(id) ON DELETE CASCADE`: Stops orphaned bills detached from any home.
+- `CONSTRAINT fk_shares_bill FOREIGN KEY (bill_id) REFERENCES bills(id) ON DELETE CASCADE`: Stops orphaned shares pointing to non-existent bills.
+- `CONSTRAINT fk_shares_member FOREIGN KEY (member_id) REFERENCES members(id) ON DELETE CASCADE`: Stops orphaned shares pointing to non-existent members.
+- `CONSTRAINT chk_bills_total_cents_positive CHECK (total_cents > 0)`: Stops zero or negative bill totals at the database storage level.
+- `CONSTRAINT chk_shares_amount_cents_positive CHECK (amount_cents > 0)`: Stops zero or negative share calculations from being saved.
+- `CONSTRAINT uq_shares_bill_member UNIQUE (bill_id, member_id)`: Stops duplicate share creation for the same member within a single bill.
+- `CONSTRAINT chk_homes_name_nonempty CHECK (length(trim(name)) > 0)`: Stops homes with blank or whitespace-only names.
+- `CONSTRAINT chk_members_name_nonempty CHECK (length(trim(name)) > 0)`: Stops members with blank or whitespace-only names.
+- `CONSTRAINT chk_bills_title_nonempty CHECK (length(trim(title)) > 0)`: Stops bills with empty titles.
