@@ -209,4 +209,5 @@ In `api/migrations/0001_init.sql`, we defined explicit named constraints to guar
 - `CONSTRAINT chk_members_name_nonempty CHECK (length(trim(name)) > 0)`: Stops members with blank or whitespace-only names.
 - `CONSTRAINT chk_bills_title_nonempty CHECK (length(trim(title)) > 0)`: Stops bills with empty titles.
 #   S t e a l t h _ P r o p _ T e c h  
+ #   S t e a l t h _ P r o p _ T e c h  
  
